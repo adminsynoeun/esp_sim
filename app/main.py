@@ -260,7 +260,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
 
     def _serve_html(self):
         try:
-            with open(HTML_PATH, 'r') as f:
+            with open(HTML_PATH, 'r', encoding='utf-8') as f:
                 html = f.read()
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
