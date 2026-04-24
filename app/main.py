@@ -459,10 +459,39 @@ def start_web_server():
     server.serve_forever()
 
 
+# ─── STARTUP REGISTRATION ───────────────────────────────
+
+def register_startup():
+    """
+    Add this EXE to Windows startup (HKCU Run key) so it launches
+    automatically on login — silently, no terminal.
+    Only runs when the app is a frozen PyInstaller EXE.
+    """
+    if not getattr(sys, 'frozen', False):
+        return  # only register when running as compiled EXE
+    try:
+        import winreg
+        exe_path = sys.executable          # full path to the .exe
+        app_name = 'RFID_CutStation'
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r'Software\Microsoft\Windows\CurrentVersion\Run',
+            0, winreg.KEY_SET_VALUE
+        )
+        winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, f'"{exe_path}"')
+        winreg.CloseKey(key)
+        _safe_print(f'  [Startup] Registered in Windows startup: {exe_path}')
+    except Exception as e:
+        _safe_print(f'  [Startup] Could not register startup entry: {e}')
+
+
 # ─── MAIN ────────────────────────────────────────────────
 
 def main():
     global db, serial_handler
+
+    # Register in Windows startup (only when running as a frozen EXE)
+    register_startup()
 
     # CLI flags override config.ini
     use_sqlserver = '--sqlserver' in sys.argv or CONFIG_DB_MODE == 'sqlserver'
@@ -476,24 +505,24 @@ def main():
     if not port_arg and CONFIG_PORT:
         port_arg = CONFIG_PORT
 
-    print("=" * 55)
-    print(f"  🏭 {STATION_NAME}")
-    print("=" * 55)
+    _safe_print('=' * 55)
+    _safe_print(f'  {STATION_NAME}')
+    _safe_print('=' * 55)
 
     # Database
     db_mode = 'SQL Server' if use_sqlserver else 'SQLite (test)'
     app_state['db_mode'] = 'sqlserver' if use_sqlserver else 'sqlite'
-    print(f"  Mode: {db_mode}")
+    _safe_print(f'  Mode: {db_mode}')
 
     if use_sqlserver:
         db_host = CFG.get('database', 'host')
         db_name = CFG.get('database', 'database')
-        print(f"  Target: {db_host}/{db_name}")
+        _safe_print(f'  Target: {db_host}/{db_name}')
 
     try:
         db = DatabaseHandler(use_sqlserver=use_sqlserver)
     except Exception as e:
-        print(f"\n❌ Database error: {e}")
+        _safe_print(f'  [ERROR] Database error: {e}')
         sys.exit(1)
 
     # Serial (ESP32)
@@ -504,28 +533,27 @@ def main():
             serial_handler.start_listening(on_card_received)
             app_state['serial_connected'] = True
             app_state['serial_port'] = port_arg
-            
         else:
-            print(f"  ⚠️  Could not open {port_arg}, trying auto-detect...")
+            _safe_print(f'  [WARN] Could not open {port_arg}, trying auto-detect...')
             detected = serial_handler.auto_connect()
             if detected:
                 serial_handler.start_listening(on_card_received)
                 app_state['serial_connected'] = True
                 app_state['serial_port'] = detected
-                print(f"  ✅ Auto-connected to {detected}")
+                _safe_print(f'  [OK] Auto-connected to {detected}')
             else:
-                print("  ⚠️  ESP32 not found, continuing without serial")
+                _safe_print('  [WARN] ESP32 not found, continuing without serial')
     else:
         # No port configured — auto-detect on startup
-        print("  🔍 No serial port configured, auto-detecting ESP32...")
+        _safe_print('  No serial port configured, auto-detecting ESP32...')
         detected = serial_handler.auto_connect()
         if detected:
             serial_handler.start_listening(on_card_received)
             app_state['serial_connected'] = True
             app_state['serial_port'] = detected
-            print(f"  ✅ Auto-connected to {detected}")
+            _safe_print(f'  [OK] Auto-connected to {detected}')
         else:
-            print("  ⚠️  ESP32 not found, continuing without serial")
+            _safe_print('  [WARN] ESP32 not found, continuing without serial')
 
     # Background serial watcher — retries auto-connect every 5 s when not connected
     def _serial_watcher():
@@ -536,14 +564,14 @@ def main():
             if _serial_watcher_stop.is_set():
                 break
             if not serial_handler.is_connected:
-                _safe_print("  🔄 Serial watcher: retrying auto-connect...")
+                _safe_print('  [Watcher] Retrying auto-connect...')
                 detected = serial_handler.auto_connect()
                 if detected:
                     serial_handler.start_listening(on_card_received)
                     app_state['serial_connected'] = True
                     app_state['serial_port'] = detected
                     app_state['status'] = f'Auto-connected to {detected}'
-                    _safe_print(f"  ✅ Serial watcher: connected to {detected}")
+                    _safe_print(f'  [Watcher] Connected to {detected}')
 
     _serial_watcher_stop.clear()
     watcher_thread = threading.Thread(target=_serial_watcher, daemon=True, name='SerialWatcher')
@@ -556,29 +584,25 @@ def main():
         usb_hid_reader.start()
         app_state['usb_reader'] = True
     else:
-        print("  ⌨️  USB HID reader disabled in config.ini ([usb_reader] enabled = false)")
+        _safe_print('  USB HID reader disabled in config.ini ([usb_reader] enabled = false)')
         app_state['usb_reader'] = False
 
     # Web server
-    print(f"  🌐 Local:    http://localhost:{WEB_PORT}")
-    print(f"  🌐 Network:  http://{LOCAL_IP}:{WEB_PORT}")
-    print("=" * 55)
-    print()
-    print("  Open the dashboard from any device on the same network.")
-    print("  Press Ctrl+C to stop.")
-    print()
+    _safe_print(f'  Local:    http://localhost:{WEB_PORT}')
+    _safe_print(f'  Network:  http://{LOCAL_IP}:{WEB_PORT}')
+    _safe_print('=' * 55)
 
     web_thread = threading.Thread(target=start_web_server, daemon=True)
     web_thread.start()
 
-    # Open browser
+    # Open browser automatically
     webbrowser.open(f'http://localhost:{WEB_PORT}')
 
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n🛑 Shutting down...")
+        _safe_print('\n[Shutdown] Stopping...')
         _serial_watcher_stop.set()   # stop the retry watcher
         if usb_hid_reader:
             usb_hid_reader.stop()
