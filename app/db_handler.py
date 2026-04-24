@@ -72,6 +72,7 @@ class DatabaseHandler:
         self.card_col = CFG.get('database', 'card_column', fallback='CardNo')
         self.size_col = CFG.get('database', 'size_column', fallback='SizeName')
         self.qty_col = CFG.get('database', 'qty_column', fallback='CutQty')
+        self.time_col = CFG.get('database', 'insert_time_column', fallback='InsertTime')
 
         if use_sqlserver:
             self._connect_sqlserver()
@@ -143,15 +144,28 @@ class DatabaseHandler:
     def lookup_card(self, card_no):
         """
         Query card data from configured table.
+        Always picks the most-recently-inserted row (ORDER BY insert_time_col DESC)
+        so that if a CardNo appears more than once the latest record wins.
         Returns: (SizeName, CutQty) or None if not found.
         """
         try:
             cursor = self.conn.cursor()
 
             if self.use_sqlserver:
-                query = f"SELECT {self.size_col}, {self.qty_col} FROM dbo.{self.table} WHERE {self.card_col} = ?"
+                query = (
+                    f"SELECT TOP 1 {self.size_col}, {self.qty_col} "
+                    f"FROM dbo.{self.table} "
+                    f"WHERE {self.card_col} = ? "
+                    f"ORDER BY [{self.time_col}] DESC"
+                )
             else:
-                query = f"SELECT {self.size_col}, {self.qty_col} FROM {self.table} WHERE {self.card_col} = ?"
+                query = (
+                    f"SELECT {self.size_col}, {self.qty_col} "
+                    f"FROM {self.table} "
+                    f"WHERE {self.card_col} = ? "
+                    f'ORDER BY "{self.time_col}" DESC '
+                    f"LIMIT 1"
+                )
 
             cursor.execute(query, (card_no,))
             row = cursor.fetchone()
@@ -159,24 +173,29 @@ class DatabaseHandler:
             if row is None:
                 return None
 
-            if self.use_sqlserver:
-                return (row[0], row[1])
-            else:
-                return (row[0], row[1])
+            return (row[0], row[1])
 
         except Exception as e:
             print(f"  ❌ DB query error: {e}")
             return None
 
     def get_all_cards(self):
-        """Get all cards for the dashboard display."""
+        """Get all cards for the dashboard display, newest first (ORDER BY insert_time_col DESC)."""
         try:
             cursor = self.conn.cursor()
 
             if self.use_sqlserver:
-                query = f"SELECT {self.card_col}, {self.size_col}, {self.qty_col} FROM dbo.{self.table} ORDER BY {self.card_col}"
+                query = (
+                    f"SELECT {self.card_col}, {self.size_col}, {self.qty_col} "
+                    f"FROM dbo.{self.table} "
+                    f"ORDER BY [{self.time_col}] DESC"
+                )
             else:
-                query = f"SELECT {self.card_col}, {self.size_col}, {self.qty_col} FROM {self.table} ORDER BY {self.card_col}"
+                query = (
+                    f"SELECT {self.card_col}, {self.size_col}, {self.qty_col} "
+                    f"FROM {self.table} "
+                    f'ORDER BY "{self.time_col}" DESC'
+                )
 
             cursor.execute(query)
             rows = cursor.fetchall()

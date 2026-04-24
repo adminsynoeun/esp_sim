@@ -80,6 +80,7 @@ app_state = {
 db = None
 serial_handler = None
 usb_hid_reader = None
+_serial_watcher_stop = threading.Event()  # signal to stop the watcher
 
 
 def _safe_print(*args, **kwargs):
@@ -503,8 +504,50 @@ def main():
             serial_handler.start_listening(on_card_received)
             app_state['serial_connected'] = True
             app_state['serial_port'] = port_arg
+            
         else:
-            print(f"  ⚠️  Could not open {port_arg}, continue without serial")
+            print(f"  ⚠️  Could not open {port_arg}, trying auto-detect...")
+            detected = serial_handler.auto_connect()
+            if detected:
+                serial_handler.start_listening(on_card_received)
+                app_state['serial_connected'] = True
+                app_state['serial_port'] = detected
+                print(f"  ✅ Auto-connected to {detected}")
+            else:
+                print("  ⚠️  ESP32 not found, continuing without serial")
+    else:
+        # No port configured — auto-detect on startup
+        print("  🔍 No serial port configured, auto-detecting ESP32...")
+        detected = serial_handler.auto_connect()
+        if detected:
+            serial_handler.start_listening(on_card_received)
+            app_state['serial_connected'] = True
+            app_state['serial_port'] = detected
+            print(f"  ✅ Auto-connected to {detected}")
+        else:
+            print("  ⚠️  ESP32 not found, continuing without serial")
+
+    # Background serial watcher — retries auto-connect every 5 s when not connected
+    def _serial_watcher():
+        """Periodically attempt auto-connect when the ESP32 is not connected."""
+        RETRY_INTERVAL = 5  # seconds between retries
+        while not _serial_watcher_stop.is_set():
+            _serial_watcher_stop.wait(RETRY_INTERVAL)
+            if _serial_watcher_stop.is_set():
+                break
+            if not serial_handler.is_connected:
+                _safe_print("  🔄 Serial watcher: retrying auto-connect...")
+                detected = serial_handler.auto_connect()
+                if detected:
+                    serial_handler.start_listening(on_card_received)
+                    app_state['serial_connected'] = True
+                    app_state['serial_port'] = detected
+                    app_state['status'] = f'Auto-connected to {detected}'
+                    _safe_print(f"  ✅ Serial watcher: connected to {detected}")
+
+    _serial_watcher_stop.clear()
+    watcher_thread = threading.Thread(target=_serial_watcher, daemon=True, name='SerialWatcher')
+    watcher_thread.start()
 
     # USB HID reader (keyboard-emulator, no focus needed)
     global usb_hid_reader
@@ -536,6 +579,7 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
+        _serial_watcher_stop.set()   # stop the retry watcher
         if usb_hid_reader:
             usb_hid_reader.stop()
         serial_handler.disconnect()
