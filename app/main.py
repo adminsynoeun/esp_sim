@@ -7,6 +7,7 @@ Architecture:
   ESP32-C3  ←→  USB Serial  ←→  This App  ←→  SQL Database
                                      ↕
                               Web Dashboard (browser)
+  USB HID RFID Reader (keyboard-emulator) ──↗
 
 Usage:
   python3 main.py                      # Uses config.ini (default: SQLite)
@@ -15,11 +16,13 @@ Usage:
 
 Config:
   Edit config.ini for per-machine settings (DB, COM port, station name).
+  [usb_reader] enabled = true/false  — toggle global keyboard hook for USB HID readers.
 """
 
 import http.server
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -30,6 +33,11 @@ from urllib.parse import urlparse, parse_qs
 from db_handler import DatabaseHandler, CFG, CONFIG_PATH, load_config
 from serial_handler import SerialHandler
 import configparser
+try:
+    import keyboard as _keyboard_lib
+    _KEYBOARD_AVAILABLE = True
+except ImportError:
+    _KEYBOARD_AVAILABLE = False
 
 # ─── READ FROM config.ini ────────────────────────────────
 STATION_NAME = CFG.get('machine', 'name')
@@ -37,9 +45,22 @@ WEB_PORT = CFG.getint('dashboard', 'web_port')
 BAUD_RATE = CFG.getint('serial', 'baud')
 CONFIG_PORT = CFG.get('serial', 'port').strip()
 CONFIG_DB_MODE = CFG.get('database', 'mode').strip().lower()
+USB_READER_ENABLED = CFG.getboolean('usb_reader', 'enabled', fallback=True)
 # ─────────────────────────────────────────────────────────
 
+def get_local_ip():
+    """Get the machine's LAN/VLAN IP address (the one used to reach the internet/gateway)."""
+    try:
+        # Connect to an external address (no data sent) to determine the outbound interface IP.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(('8.8.8.8', 80))
+            return s.getsockname()[0]
+    except Exception:
+        return '127.0.0.1'
+
+
 # Global state
+LOCAL_IP = get_local_ip()
 app_state = {
     'serial_connected': False,
     'serial_port': '',
@@ -52,10 +73,21 @@ app_state = {
     'total_scans': 0,
     'total_cuts': 0,
     'status': 'Ready',
+    'local_ip': LOCAL_IP,
+    'network_url': f'http://{LOCAL_IP}:{WEB_PORT}',
 }
 
 db = None
 serial_handler = None
+usb_hid_reader = None
+
+
+def _safe_print(*args, **kwargs):
+    """Print that won't crash when stdout is None (silent EXE / no console)."""
+    try:
+        print(*args, **kwargs)
+    except Exception:
+        pass
 
 
 def log_activity(card_no, size_name, cut_qty, status='ok'):
@@ -77,37 +109,150 @@ def on_card_received(card_no):
     """Called when ESP32 sends a card number via serial."""
     global app_state
 
-    print(f"\n📥 Card received: {card_no}")
-    app_state['total_scans'] += 1
-    app_state['status'] = f'Processing card {card_no}...'
+    try:
+        _safe_print(f"\n[CARD] Card received: {card_no}")
+        app_state['total_scans'] += 1
+        app_state['status'] = f'Processing card {card_no}...'
 
-    # Query database
-    result = db.lookup_card(card_no)
+        # Query database
+        result = db.lookup_card(card_no)
 
-    if result is None:
-        print(f"  ❌ Card {card_no} NOT FOUND")
-        serial_handler.send_cut(0, "NOT FOUND")
-        log_activity(card_no, '—', 0, 'not_found')
-        app_state['status'] = f'Card {card_no} not found'
+        if result is None:
+            _safe_print(f"  [X] Card {card_no} NOT FOUND")
+            serial_handler.send_cut(0, "NOT FOUND")
+            log_activity(card_no, '\u2014', 0, 'not_found')
+            app_state['status'] = f'Card {card_no} not found'
+            app_state['last_card'] = card_no
+            app_state['last_size'] = '\u2014'
+            app_state['last_qty'] = 0
+            return
+
+        size_name, cut_qty = result
+        _safe_print(f"  [OK] Card {card_no} -> Size: {size_name}, CutQty: {cut_qty}")
+
+        # Send to ESP
+        serial_handler.send_cut(cut_qty, size_name)
+
+        # Update state
+        app_state['total_cuts'] += cut_qty
         app_state['last_card'] = card_no
-        app_state['last_size'] = '—'
-        app_state['last_qty'] = 0
-        return
+        app_state['last_size'] = size_name
+        app_state['last_qty'] = cut_qty
+        app_state['status'] = f'Cutting {cut_qty}x {size_name}'
 
-    size_name, cut_qty = result
-    print(f"  ✅ Card {card_no} → Size: {size_name}, CutQty: {cut_qty}")
+        log_activity(card_no, size_name, cut_qty, 'ok')
 
-    # Send to ESP
-    serial_handler.send_cut(cut_qty, size_name)
+    except Exception as e:
+        _safe_print(f"  [ERROR] on_card_received failed: {e}")
+        app_state['status'] = f'Error processing card {card_no}'
 
-    # Update state
-    app_state['total_cuts'] += cut_qty
-    app_state['last_card'] = card_no
-    app_state['last_size'] = size_name
-    app_state['last_qty'] = cut_qty
-    app_state['status'] = f'Cutting {cut_qty}x {size_name}'
 
-    log_activity(card_no, size_name, cut_qty, 'ok')
+
+# ─── USB HID READER (keyboard-emulator RFID reader) ─────
+
+class UsbHidReader:
+    """
+    Captures card numbers from a USB HID RFID reader (keyboard-emulator type).
+
+    These readers work by typing the card number rapidly followed by Enter.
+    This class installs a GLOBAL keyboard hook (no window focus required)
+    using the `keyboard` library, buffers the keystrokes, and fires
+    `on_card_received()` when Enter is detected.
+
+    Notes:
+    - Requires the `keyboard` Python package (pip install keyboard).
+    - On Windows, must run as Administrator (or elevated) for the hook to work.
+    - A debounce timer prevents the same card from firing twice in quick succession.
+    """
+
+    # Characters that are valid inside a card number (digits + letters + dash/underscore)
+    _VALID_CHARS = set('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_')
+    # Minimum characters to treat as a real card scan (not a stray keystroke)
+    _MIN_LEN = 4
+    # Seconds to ignore a duplicate of the same card (debounce)
+    _DEBOUNCE_SEC = 2.0
+
+    def __init__(self, callback):
+        self._callback = callback
+        self._buffer = []
+        self._lock = threading.Lock()
+        self._last_card = None
+        self._last_time = 0.0
+        self._last_key_time = 0.0   # timestamp of last keystroke (for gap detection)
+        self._hook = None
+        self._running = False
+
+    def start(self):
+        """Install the global keyboard hook."""
+        if not _KEYBOARD_AVAILABLE:
+            _safe_print("  ⚠️  `keyboard` library not installed — USB HID reader disabled.")
+            _safe_print("      Run: pip install keyboard")
+            return False
+        try:
+            self._running = True
+            self._hook = _keyboard_lib.on_press(self._on_key)
+            _safe_print("  ⌨️  USB HID reader: global keyboard hook active.")
+            return True
+        except Exception as e:
+            _safe_print(f"  ⚠️  USB HID reader hook failed: {e}")
+            _safe_print("      Try running as Administrator.")
+            return False
+
+    def stop(self):
+        """Remove the global keyboard hook."""
+        if self._hook is not None:
+            try:
+                _keyboard_lib.unhook(self._hook)
+            except Exception:
+                pass
+            self._hook = None
+        self._running = False
+        _safe_print("  ⌨️  USB HID reader: hook removed.")
+
+    def _on_key(self, event):
+        """Called for every key press system-wide."""
+        if not self._running:
+            return
+
+        name = event.name  # e.g. 'a', '5', 'enter', 'space', 'backspace'
+        now = time.time()
+
+        with self._lock:
+            # ── Gap detector ──────────────────────────────────────────
+            # HID readers fire all digits within ~5–15 ms of each other.
+            # If more than 100 ms has elapsed since the last key, this is
+            # a new "burst" — discard any leftover chars from a previous
+            # incomplete scan (e.g. the stray 'm' prefix some readers emit).
+            if self._buffer and (now - self._last_key_time) > 0.1:
+                self._buffer.clear()
+            self._last_key_time = now
+            # ──────────────────────────────────────────────────────────
+
+            if name in ('enter', 'return'):          # Card scan complete
+                card = ''.join(self._buffer).strip()
+                self._buffer.clear()
+                if len(card) >= self._MIN_LEN:
+                    self._fire(card)
+
+            elif name == 'backspace' and self._buffer:  # Allow corrections
+                self._buffer.pop()
+
+            elif len(name) == 1 and name in self._VALID_CHARS:  # Normal character
+                self._buffer.append(name)
+
+            # Ignore modifier keys, arrows, function keys, etc.
+
+    def _fire(self, card_no):
+        """Debounce and dispatch to the callback on a separate thread."""
+        now = time.time()
+        if card_no == self._last_card and (now - self._last_time) < self._DEBOUNCE_SEC:
+            _safe_print(f"  [HID] Debounced duplicate scan: {card_no}")
+            return
+        self._last_card = card_no
+        self._last_time = now
+        _safe_print(f"  [HID] USB reader scan: {card_no}")
+        # Run callback off the hook thread so we don't block key events
+        threading.Thread(target=self._callback, args=(card_no,), daemon=True).start()
 
 
 # ─── WEB SERVER ──────────────────────────────────────────
@@ -141,6 +286,28 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         elif parsed.path == '/api/ports':
             ports = SerialHandler.list_ports()
             self._json_response(ports)
+
+        elif parsed.path == '/api/network':
+            # Return all network addresses this server is reachable on
+            addrs = []
+            try:
+                hostname = socket.gethostname()
+                # Get all IPs bound to this host
+                for info in socket.getaddrinfo(hostname, None):
+                    ip = info[4][0]
+                    if ':' not in ip and ip != '127.0.0.1':  # IPv4 only, skip loopback
+                        if ip not in [a['ip'] for a in addrs]:
+                            addrs.append({'ip': ip, 'url': f'http://{ip}:{WEB_PORT}'})
+            except Exception:
+                pass
+            # Always include the primary detected IP
+            primary = {'ip': LOCAL_IP, 'url': f'http://{LOCAL_IP}:{WEB_PORT}'}
+            if primary not in addrs:
+                addrs.insert(0, primary)
+            self._json_response({
+                'localhost': f'http://localhost:{WEB_PORT}',
+                'addresses': addrs,
+            })
 
         elif parsed.path == '/api/settings':
             # Return current config.ini values
@@ -265,16 +432,22 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.end_headers()
-            self.wfile.write(html.encode())
+            try:
+                self.wfile.write(html.encode())
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+                pass  # Client disconnected before response was sent — harmless
         except FileNotFoundError:
             self.send_error(500, 'dashboard.html not found')
 
     def _json_response(self, data):
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+            pass  # Client disconnected before response was sent — harmless
 
 
 def start_web_server():
@@ -322,7 +495,7 @@ def main():
         print(f"\n❌ Database error: {e}")
         sys.exit(1)
 
-    # Serial
+    # Serial (ESP32)
     serial_handler = SerialHandler(port=port_arg, baud=BAUD_RATE)
 
     if port_arg:
@@ -333,11 +506,22 @@ def main():
         else:
             print(f"  ⚠️  Could not open {port_arg}, continue without serial")
 
+    # USB HID reader (keyboard-emulator, no focus needed)
+    global usb_hid_reader
+    usb_hid_reader = UsbHidReader(on_card_received)
+    if USB_READER_ENABLED:
+        usb_hid_reader.start()
+        app_state['usb_reader'] = True
+    else:
+        print("  ⌨️  USB HID reader disabled in config.ini ([usb_reader] enabled = false)")
+        app_state['usb_reader'] = False
+
     # Web server
-    print(f"  🌐 Dashboard: http://localhost:{WEB_PORT}")
+    print(f"  🌐 Local:    http://localhost:{WEB_PORT}")
+    print(f"  🌐 Network:  http://{LOCAL_IP}:{WEB_PORT}")
     print("=" * 55)
     print()
-    print("  Open the dashboard in your browser.")
+    print("  Open the dashboard from any device on the same network.")
     print("  Press Ctrl+C to stop.")
     print()
 
@@ -352,6 +536,8 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
+        if usb_hid_reader:
+            usb_hid_reader.stop()
         serial_handler.disconnect()
         db.close()
 

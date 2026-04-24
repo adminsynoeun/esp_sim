@@ -7,6 +7,14 @@ Protocol:
   App → ESP:   CUT:<qty>:<size_name>\n   (qty=0 means not found)
 """
 
+
+def _safe_print(*args, **kwargs):
+    """Print that won't crash when stdout is None (silent EXE mode)."""
+    try:
+        print(*args, **kwargs)
+    except Exception:
+        pass
+
 import serial
 import serial.tools.list_ports
 import threading
@@ -138,16 +146,20 @@ class SerialHandler:
                     if line.startswith("CARD:"):
                         card_no = line.split(":", 1)[1].strip()
                         if self.on_card_received:
-                            self.on_card_received(card_no)
+                            # ── Isolate callback so its exceptions never kill the loop ──
+                            try:
+                                self.on_card_received(card_no)
+                            except Exception as cb_err:
+                                _safe_print(f"  ❌ Card callback error: {cb_err}")
 
                 time.sleep(0.01)
 
             except serial.SerialException:
-                print("  ❌ Serial connection lost")
+                _safe_print("  ❌ Serial connection lost")
                 self.running = False
                 break
             except Exception as e:
-                print(f"  ❌ Listen error: {e}")
+                _safe_print(f"  ❌ Listen error: {e}")
                 time.sleep(0.1)
 
     @property

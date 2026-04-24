@@ -26,13 +26,13 @@ if errorlevel 1 (
 )
 
 echo   [1/4] Installing build tools...
-pip install pyserial pyinstaller pyodbc --quiet 2>nul
-pip install pyserial pyinstaller --quiet
+pip install pyserial pyinstaller pyodbc keyboard --quiet 2>nul
+pip install pyserial pyinstaller keyboard --quiet
 
-echo   [2/4] Creating EXE...
+echo   [2/4] Creating EXE (no console window)...
 cd /d "%~dp0app"
 
-pyinstaller --noconfirm --onefile --console ^
+pyinstaller --noconfirm --onefile --noconsole ^
     --name "RFID_CutStation" ^
     --icon=NUL ^
     --add-data "dashboard.html;." ^
@@ -41,6 +41,7 @@ pyinstaller --noconfirm --onefile --console ^
     --hidden-import serial.tools.list_ports ^
     --hidden-import serial.tools.list_ports_common ^
     --hidden-import serial.tools.list_ports_windows ^
+    --hidden-import keyboard ^
     main.py
 
 echo   [3/4] Copying config files...
